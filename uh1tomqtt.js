@@ -5,7 +5,9 @@
 const SerialPort = require('serialport').SerialPort;
 const mqtt = require('mqtt');
 const dcblib = require('./dcblib.js');
+const {RS485BusManager} = require('./dcblib.js');
 const fs = require('fs');
+
 //const uh1txport = 'usb-WCH.CN_USB_Quad_Serial_BC6283ABCD-if00'; 
 //const uh1rxport = 'usb-WCH.CN_USB_Quad_Serial_BC6283ABCD-if02'; 
 const uh1txport = 'usb-1a86_USB_Serial-if00-port0';
@@ -96,11 +98,13 @@ async function initialise(log = false){
     } else {
         rxport = await openPort(uh1rxport);
     }
-    
+    let rs485bus_manager = new RS485BusManager(rxport, txport);
+    console.log('rs485bus_manager created');
     for(const id of slaveIds){
-        const thermostat = new dcblib.Thermostat(id, masterid, txport, rxport, log);
+        const thermostat = new dcblib.Thermostat(id, masterid, rs485bus_manager, log);
         thermostats.push(thermostat);
     }
+    console.log('Thermostats created');
 }
 
 async function readThermostats(){
