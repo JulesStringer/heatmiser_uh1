@@ -7,6 +7,7 @@ const mqtt = require('mqtt');
 const dcblib = require('./dcblib.js');
 const {RS485BusManager} = require('./dcblib.js');
 const fs = require('fs');
+const baud_rate = 4800;
 
 //const uh1txport = 'usb-WCH.CN_USB_Quad_Serial_BC6283ABCD-if00'; 
 //const uh1txport = 'usb-WCH.CN_USB_Quad_Serial_BC6283ABCD-if02'; 
@@ -19,53 +20,87 @@ const mqtt_broker_file = '/home/jules/.credentials/mqtt/mqtt_broker.json';
 // the UH1 RS485 bus is connected to the first position on a waveshare 4XRS485 to USB box,
 // which is plugged in to a USB port on the raspberry Pi
 //
-async function findSerialPort(pnpId) {
+async function findAvailableSerialPort(pnpId, baud_rate) {
     const ports = await SerialPort.list();
-    let myport = null;
-    ports.forEach(port => {
-        console.log(`Comparing Port: ${port.path}, pnpId: ${port.pnpId}`);
-        //console.log(JSON.stringify(port));
-        if ( port.pnpId === pnpId){   
-            console.log('Found port');
-            myport = port;
-            return myport;
+    
+    // 1. Filter ports by the non-unique pnpId
+    const candidatePorts = ports.filter(port => port.pnpId && port.pnpId.includes(pnpId));
+
+    console.log(`Found ${candidatePorts.length} candidate ports with pnpId ${pnpId}.`);
+
+    for (const portInfo of candidatePorts) {
+        console.log(`Testing Port: ${portInfo.path}`);
+        
+        // 2. Attempt to create and open the port
+        const sport = new SerialPort({
+            path: portInfo.path, 
+            baudRate: baud_rate, // Use the specific baud rate for the device you are looking for (e.g., 9600 for Modbus)
+            dataBits: 8,
+            parity: 'none',
+            stopBits: 1,
+            rtscts: true,
+            autoOpen: false 
+        });
+
+        let portIsAvailable = false;
+        
+        try {
+            // Attempt to open the port. If another process has it locked, this will throw an error.
+            await new Promise((resolve, reject) => {
+                sport.open((err) => {
+                    if (err) {
+                        console.log(`-> Port ${portInfo.path} is busy or unavailable. Error: ${err.message}`);
+                        reject(err);
+                    } else {
+                        console.log(`-> Port ${portInfo.path} successfully opened (Available).`);
+                        portIsAvailable = true;
+                        resolve();
+                    }
+                });
+            });
+            
+            // 3. If the open succeeded, return the port and exit the function.
+            if (portIsAvailable) {
+                return sport;
+            }
+            
+        } catch (e) {
+            // Error means the port is busy or has other issues. Loop continues to the next port.
         }
-    });
-    return myport;
+        
+        // IMPORTANT: If we failed to open (busy) or opened and we need to move on (shouldn't happen here), 
+        // ensure the port is closed before the next iteration.
+        if (sport.isOpen) {
+            sport.close(() => {});
+        }
+    }
+    
+    // 4. If the loop completes without finding an available port
+    return null;
 }
-async function openPort(portId){
-    console.log('portId: ' + portId);
-    const port = await findSerialPort(portId);
-    console.log('target port: ' + JSON.stringify(port));
-    console.log('target port: ', port);
-    console.log('Type of port: ', typeof port);
-    console.log('path: ' + port.path);
-//    Media. The system is based around half duplex RS485 bus 2 wire data ,
-//    The frame format is 4800bps, data: 8 bit, start: 1 bit, stop: 1 bit, no parity chec
-    const sport = new SerialPort({
-        path: port.path, 
-        baudRate: 4800,
-        dataBits: 8,
-        parity: 'none',
-        stopBits: 1,
-        rtscts: true,
-        autoOpen: false  // Set to false to control when to open
-    });
+async function openPort(pnpId){
+    const sport = await findAvailableSerialPort(pnpId, baud_rate);
+    
+    if (!sport) {
+        throw new Error(`Could not find an available serial port with pnpId ${pnpId}`);
+    }
+
+    console.log(`Modbus using path: ${sport.path}`);
+
+    // Assuming the port is already open from findAvailableSerialPort, 
+    // you would only need to add listeners and handle initialization.
+    // However, if the logic above closes the port on failure, 
+    // you need to safely re-open it here OR modify the discovery function
+    // to return the OPEN port.
+    
+    // --- Assuming findAvailableSerialPort returns an OPEN port ---
+    
     // Error listener for port errors
     sport.on('error', (err) => {
-        console.log(`Serial Port Error on ${port.path}:`, err.message);
+        console.log(`Serial Port Error on ${sport.path}:`, err.message);
     });
     
-    return new Promise((resolve, reject) => {
-        sport.open((err) => {
-            if (err) {
-                console.log('Error opening port: ', err.message);
-                reject(err);
-            }
-            console.log('Opened port');
-            resolve(sport);
-        });
-    });
+    return sport;
 }
 function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
