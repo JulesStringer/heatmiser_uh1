@@ -9,7 +9,7 @@ const {RS485BusManager} = require('./dcblib.js');
 const fs = require('fs');
 
 //const uh1txport = 'usb-WCH.CN_USB_Quad_Serial_BC6283ABCD-if00'; 
-//const uh1rxport = 'usb-WCH.CN_USB_Quad_Serial_BC6283ABCD-if02'; 
+//const uh1txport = 'usb-WCH.CN_USB_Quad_Serial_BC6283ABCD-if02'; 
 const uh1txport = 'usb-1a86_USB_Serial-if00-port0';
 const uh1rxport = uh1txport;
 const masterid = 130;
@@ -34,6 +34,7 @@ async function findSerialPort(pnpId) {
     return myport;
 }
 async function openPort(portId){
+    console.log('portId: ' + portId);
     const port = await findSerialPort(portId);
     console.log('target port: ' + JSON.stringify(port));
     console.log('target port: ', port);
@@ -141,7 +142,7 @@ async function checktime(thermostat){
 }
 async function publishThermostats(){
     const mqtt_client = await connect_mqtt();
-    await initialise();
+    await initialise(false);
     await readThermostats();
     // handle any updates
     mqtt_client.subscribe('heatmiser_update/#');

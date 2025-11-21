@@ -6,6 +6,7 @@ const SerialPort = require('serialport').SerialPort;
 const Readline = require('@serialport/parser-readline');
 const os = require('os');
 const {RetryPolicy} = require('./retry_policy.js');
+const E_TIMEOUT = require('./retry_policy.js').E_TIMEOUT;
 const {Mutex} = require('async-mutex');
 
 function getCRC(buffer) {
@@ -43,52 +44,104 @@ function getCRC(buffer) {
     return { high: m_High, low: m_Low };
 }
 class RS485BusManager {
-    constructor(rxport, txport) {
+    constructor(rxport, txport, trace = false) {
         // 1. OWN the shared resources
         this.rxport = rxport;
         this.txport = txport;
         this.accessMutex = new Mutex();
+        this.trace = trace;
     }
 
     // 2. Publicly expose the safe access method
     async accessBus(operationFunction) {
         const release = await this.accessMutex.acquire();
         try {
-            this.rxpost.flush();
-            this.txport.flush();
-            this.rxport.removeAllListeners('data');
             return await operationFunction();
         } finally {
-            this.rxport.removeAllListeners('data');
-            this.rxport.flush();
-            this.txport.flush();
             release();
         }
     }
-    async send_request(request, on_data){
-        await this.accessBus(async => {
-            this.txport.write(request, (err) => {
-                if (err) {
-                    reject(`Error writing to port: ${err.message}`);
-                }
-                this.log('request: ' + request.toString('hex'));
+    log(msg){
+        if ( this.trace){
+            console.log(msg);
+        }
+    }
+    async delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+    async send_request(request, on_data, timeoutMs = 2000, log = console.log) { // Add log for debugging
+        return await this.accessBus(async () => {
+            await this.delay(50);
+
+
+            return new Promise(async (resolve, reject) => {    
+                let timeoutId;
+
+                const cleanupAndResolve = (result) => {
+                    clearTimeout(timeoutId);
+                    this.rxport.removeAllListeners('data');
+                    this.txport.drain(() => {
+                        this.rxport.flush();
+                        this.txport.flush();
+                        resolve(result);
+                    });
+                };
+                const cleanupAndReject = (error) => {
+                    clearTimeout(timeoutId);
+                    this.rxport.removeAllListeners('data');
+                    this.txport.drain(() => {
+                        this.rxport.flush();
+                        this.txport.flush();
+                        reject(error);
+                    });
+                };
+                this.rxport.removeAllListeners('data');
+                this.txport.flush();
+                this.rxport.flush();
+                //this.log('About to write request: ' + request.toString('hex'));
                 let responseBuffer = Buffer.alloc(0);
-                let requestmatched = this.rxport === this.txport;
-                this.rxport.on('data', (data) => {
-                    if ( !requestmatched && data.equals(request)){
-                        this.log('data matches request discarding');
-                        requestmatched = true;
-                    } else if ( requestmatched ){
-                        responseBuffer = Buffer.concat([responseBuffer, data]);
-                        let result = on_data(responseBuffer);
-                        return result;
+                // Use an arrow function for proper 'this' binding
+                const dataHandler = (data) => {
+                    responseBuffer = Buffer.concat([responseBuffer, data]);
+                    try {
+                        // 3. Call the Thermostat's logic (on_data) to check for a full packet.
+                        //    - Thermostat returns the valid response data OR null.
+                        let result = on_data(responseBuffer); 
+                        if (result !== null && result !== undefined) {
+                            //console.log('result :' + result.toString('hex'));
+                            // Packet is complete and valid!
+                            // 4. Cleanup and Resolve the outer Promise
+                            cleanupAndResolve(result);
+                        } 
+                        // If result is null/undefined, we know the packet is incomplete, so we keep listening.
+                        
+                    } catch (err) {
+                        // CRC mismatch or invalid format error thrown by on_data
+                        cleanupAndReject(err);
                     }
+                }
+                this.rxport.on('data', dataHandler);
+
+                timeoutId = setTimeout(() => {
+                    const err = new Error("Transaction timed out internally. (T-Stat unresponsive)");
+                    err.code = "E_TIMEOUT_INTERNAL";
+                    cleanupAndReject(err);
+                }, timeoutMs); // <--- USE THE PASSED TIMEOUT VALUE
+
+                this.txport.write(request, (err) => {
+                    if (err) {
+                        //reject(`Error writing to port: ${err.message}`);
+                        cleanupAndReject(err);
+                    }
+                    //console.log('Written request: ' + request.toString('hex'));
+                    this.log('request: ' + request.toString('hex'));
                 });
             });
         });
     }
 }
 exports.RS485BusManager = RS485BusManager;
+const TOO_MANY_RETRIES = "Too many retries - giving up";
 const dcb_constants = {
     HM_ADDRESS_FROST_PROTECTION_TEMPERATURE:17,
     HM_ADDRESS_SET_ROOM_TEMPERATURE:        18,
@@ -114,6 +167,7 @@ class Thermostat {
     constructor(thermostatID, masterID, rs485bus_manager, trace = false, echo = false) {
         this.thermostatID = thermostatID;  // ID of the thermostat
         this.masterID = masterID;          // ID of the sender (master)
+        rs485bus_manager.trace = trace;
         this.rs485bus_manager = rs485bus_manager,
         this.timeout = 2000;               // 2-second timeout for responses
         this.trace = trace;
@@ -157,6 +211,7 @@ class Thermostat {
         // Final request with CRC
         return Buffer.concat([request, crcBuffer]);
     }
+
     // Send a request (read or write) and handle the response
     async sendRequest(commandType, dcbAddress, dataLength, data = []) {
         const request = this.createRequest(commandType, dcbAddress, dataLength, data);
@@ -165,7 +220,8 @@ class Thermostat {
         try {
             return await retry_policy.retry(this.writeAndReadResponse.bind(this), request);
         } catch (error) {
-            if ( error.code === retry_policy.E_TIMEOUT){
+            if ( error.code === E_TIMEOUT){
+                console.error(TOO_MANY_RETRIES);
                 process.exit(-1);
             }
             throw(error);
@@ -189,7 +245,8 @@ class Thermostat {
         try {
             return await retry_policy.retry(this.writeUpdateRequest.bind(this), request);
         } catch (error) {
-            if ( error.code === retry_policy.E_TIMEOUT){
+            if ( error.code === E_TIMEOUT){
+                console.error(TOO_MANY_RETRIES);
                 process.exit(-1);
             }
             throw(error);
@@ -213,106 +270,61 @@ class Thermostat {
         }
     }
     async writeUpdateRequest(request){
-        return await this.rs485bus_manager.accessBus(async () => {
-            return new Promise((resolve, reject) => {
-                const rxport = this.rs485bus_manager.rxport;
-                const txport = this.rs485bus_manager.txport;
-                txport.flush();
-                rxport.flush();
-                rxport.removeAllListeners('data');
-                txport.write(request, (err) => {
-                    if (err) {
-                        reject(`Error writing to port: ${err.message}`);
-                    }
-                    this.log('request: ' + request.toString('hex'));
-                    let responseBuffer = Buffer.alloc(0);
-                    let requestmatched = this.echo ? false : true;
-                    rxport.on('data', (data) => {
-                        //console.log('data: ' + data.toString());
-                        if ( !requestmatched && data.equals(request)){
-                            this.log('data matches request discarding');
-                            requestmatched = true;
-                        } else if ( requestmatched ){
-                            responseBuffer = Buffer.concat([responseBuffer, data]);
-                            if ( responseBuffer.length > 6){
-                                rxport.removeAllListeners('data');
-                                const crcReceived = responseBuffer.readUInt16LE(5);
-                                const crc = getCRC(responseBuffer.slice(0, 5));
-                                const crcCalculated = crc.high << 8 | (crc.low & 0xFF);
-                                if (crcReceived === crcCalculated) {
-                                    this.log('Packet accepted');
-                                    resolve();
-                                } else {
-                                    const err = new Error('CRC mismatch, discarding response, crcReceived: ' + crcReceived + ' crcCalculated: ' + crcCalculated);
-                                    this.log(err.toString());
-                                    reject(err);
-                                }
-                            }
-                        }
-                    });
-                });
-            });
+        return await this.rs485bus_manager.send_request(request, (data) => {
+            // response to a write packet is just 7 bytes
+            if ( data.length >= 7){
+                const crcReceived = data.readUInt16LE(5);
+                const crc = getCRC( data.slice(0, 5));
+                const crcCalculated = crc.high << 8 | (crc.low & 0xFF);
+                if (crcReceived === crcCalculated) {
+                    this.log('Packet accepted');
+                    return true;
+                } else {
+                    const err = new Error('CRC mismatch, discarding response, crcReceived: ' + crcReceived + ' crcCalculated: ' + crcCalculated);
+                    this.log(err.toString());
+                    throw(err);
+                }
+            }
+            return null;
         });
     }
     // Function to write the request and read the response
     async writeAndReadResponse(request) {
-        return await this.rs485bus_manager.accessBus(async () => {
-            return new Promise((resolve, reject) => {
-                const rxport = this.rs485bus_manager.rxport;
-                const txport = this.rs485bus_manager.txport;
-                txport.flush();
-                rxport.flush();
-                rxport.removeAllListeners('data');
-                txport.write(request, (err) => {
-                    if (err) {
-                        return reject(`Error writing to port: ${err.message}`);
-                    }
-                    this.log('request: ' + request.toString('hex'));
-                    let responseBuffer = Buffer.alloc(0);
-                    let requestmatched = this.echo ? false : true;
-                    rxport.on('data', (data) => {
-                        //console.log('data: ' + data.toString());
-                        if ( !requestmatched && data.equals(request)){
-                            this.log('data matches request discarding');
-                            requestmatched = true;
-                        } else if ( requestmatched ){
-                            responseBuffer = Buffer.concat([responseBuffer, data]);
-                            if (responseBuffer.length >= 11) {
-                                // Wait until at least 11 bytes (header) + response data length + 2 CRC bytes are received
-                                const header = responseBuffer.slice(0, 11);
-                                const dataLength = header.readUInt16LE(1) - 11;  // Extract data length from header
-                                const expectedLength = 9 + dataLength + 2;  // Total length with CRC
-                                this.log('expectedLength: ' + expectedLength + ' received so far : ' + responseBuffer.length);
-                                if (responseBuffer.length >= expectedLength) {
-                                    rxport.removeAllListeners('data');
-
-                                    const dcb = responseBuffer.slice(9, expectedLength - 2);
-                                    const crcReceived = responseBuffer.readUInt16LE(expectedLength - 2);
-                                    const crc = getCRC(responseBuffer.slice(0, expectedLength - 2));
-                                    const crcCalculated = crc.high << 8 | (crc.low & 0xFF)
-                                    if (crcReceived === crcCalculated) {
-                                        if ( header[3] != this.thermostatID){
-                                            let err = new Error('Received dcb for ' + header[3] + ' requested thermostat ' +this.thermostatID);
-                                            reject(err);
-                                        } else {
-                                            this.log(`Received valid response from thermostat ${this.thermostatID}`);
-                                            for(let i = 0; i < dcb.length; i += 10){
-                                                let t = dcb.slice(i, i + 10);
-                                                this.log(i + ' : ' + t.toString('hex'));
-                                            }
-                                            this.log('dcb length: ' + (dcb[0] << 8 | dcb[1]));
-                                            resolve(dcb);  // Return the DCB data
-                                        }
-                                    } else {
-                                        const err = new Error('CRC mismatch, discarding response, crcReceived: ' + crcReceived + ' crcCalculated: ' + crcCalculated);
-                                        reject(err);
-                                    }
-                                }
+        return await this.rs485bus_manager.send_request(request, (data) => {
+            if ( data.length >= 11){
+                // Wait until at least 11 bytes (header) + response data length + 2 CRC bytes are received
+                const header = data.slice(0, 11);
+                //console.log('Header was ' + header.toString('hex'));
+                const dataLength = header.readUInt16LE(1) - 11;  // Extract data length from header
+                //console.log('dataLength: ' + dataLength);
+                const expectedLength = 9 + dataLength + 2;  // Total length with CRC
+                this.log('expectedLength: ' + expectedLength + ' received so far : ' + data.length);
+                if ( data.length >= expectedLength) {
+                    const dcb = data.slice(9, expectedLength - 2);
+                    const crcReceived = data.readUInt16LE(expectedLength - 2);
+                    const crc = getCRC(data.slice(0, expectedLength - 2));
+                    const crcCalculated = crc.high << 8 | (crc.low & 0xFF);
+                    //console.log(` crc: ${crcCalculated} crcReceived: ${crcReceived} `);
+                    if (crcReceived === crcCalculated) {
+                        if ( header[3] != this.thermostatID){
+                            let err = new Error('Received dcb for ' + header[3] + ' requested thermostat ' +this.thermostatID);
+                            throw(err);
+                        } else {
+                            //console.log(`Received valid response from thermostat ${this.thermostatID}`);
+                            for(let i = 0; i < dcb.length; i += 10){
+                                let t = dcb.slice(i, i + 10);
+                                this.log(i + ' : ' + t.toString('hex'));
                             }
+                            //console.log('dcb length: ' + (dcb[0] << 8 | dcb[1]));
+                            return dcb;  // Return the DCB data
                         }
-                    });
-                });
-            });
+                    } else {
+                        const err = new Error('CRC mismatch, discarding response, crcReceived: ' + crcReceived + ' crcCalculated: ' + crcCalculated);
+                        throw err;
+                    }
+                }
+            }
+            return null;
         });
     }
     decodesensors(dcb){
@@ -553,14 +565,10 @@ const UPDATEDEF c_updateDefs[MAX_UPDATE_FIELD] = {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
     async read(){
-        let dcb = null;
-        for(let retry = 0; retry < 5 && !dcb; retry++){
-            dcb = await this.ReadDCB().catch((err) => {
-                console.log(err.toString());
-            });
+        let dcb = await this.ReadDCB().catch((err) => {
+            console.log(err.toString());
 
-            await this.delay(500);
-        }
+        });
         if ( dcb ){
             this.config = this.decodeconfig(dcb);
             this.status = this.decodestatus(dcb);
