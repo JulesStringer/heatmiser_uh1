@@ -153,6 +153,7 @@ async function readThermostats(){
     }
 }
 async function checktime(thermostat){
+    console.log(`checktime ID: ${thermostat.thermostatID}`)
     if ( thermostat.status ){
         let d = new Date();
         let day = d.getDay();
@@ -161,8 +162,9 @@ async function checktime(thermostat){
         let minute = d.getMinutes();
         let second = d.getSeconds();
         let timenow = minutetime(day, hour, minute);
-        let dt = thermostat.status.dayandtime;
+        let dt = thermostat.status.dayandtime_split;
         let thermotime = minutetime(dt.day, dt.hour, dt.minute);
+        console.log(`thermotime ${thermotime} timenow ${timenow}`);
         let tdiff = thermotime > timenow ? (thermotime - timenow) : (timenow - thermotime);
         if ( tdiff > 1 ){
             console.log(`timenow: ${timenow} thermotime: ${thermotime} tdiff: ${tdiff}`);
@@ -355,10 +357,11 @@ async function set_time(){
         let timenow = minutetime(day, hour, minute);
         //timenow += 5;
         console.log(`Day ${day} ${hour}:${minute}:${second}` );
-        let dt = t.status.dayandtime;
+        let dt = t.status.dayandtime_split;
         console.log(`thermostat: ${t.thermostatID} time: ${JSON.stringify(dt)}`);
         let thermotime = minutetime(dt.day, dt.hour, dt.minute);
         let tdiff = thermotime > timenow ? (thermotime - timenow) : (timenow - thermotime);
+        console.log(`timenow: ${timenow} thermotime ${thermotime} tdiff ${tdiff}`);
         if ( tdiff > 1 ){
             console.log(`timenow: ${timenow} thermotime: ${thermotime} tdiff: ${tdiff}`);
             let time_array = [day, hour, minute, second];
