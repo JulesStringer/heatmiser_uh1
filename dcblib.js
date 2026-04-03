@@ -404,7 +404,8 @@ class Thermostat {
         let second = dcb[39];
         d = new Date(year,month,dmon,hour,minute,second);
         let ts = d.toISOString();
-        return ts.split('.')[0];
+        //return ts.split('.')[0];
+        return ts;
     }
     decode_status_summary(dcb){
         let status = {};
